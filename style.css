@@ -1,0 +1,102 @@
+import React, {useEffect, useMemo, useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import {createClient} from '@supabase/supabase-js';
+import './style.css';
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+function formatDate(value){ return value ? new Date(value).toLocaleDateString('de-DE') : '-'; }
+function formatMoney(value){ return Number(value || 0).toLocaleString('de-DE') + ' €'; }
+
+function AuthScreen(){
+  const [mode,setMode]=useState('login');
+  const [email,setEmail]=useState('');
+  const [password,setPassword]=useState('');
+  const [company,setCompany]=useState('');
+  const [contact,setContact]=useState('');
+  const [message,setMessage]=useState('');
+  async function submit(e){
+    e.preventDefault(); setMessage('');
+    if(mode==='login'){
+      const {error}=await supabase.auth.signInWithPassword({email,password});
+      if(error) setMessage(error.message);
+      return;
+    }
+    const {data,error}=await supabase.auth.signUp({email,password});
+    if(error){ setMessage(error.message); return; }
+    const user=data.user;
+    if(user){
+      await supabase.from('profiles').insert({id:user.id,email,company_name:company || contact || email,contact_name:contact,role:'partner'});
+      await supabase.from('activities').insert({type:'Registrierung',user_name:company || email,details:'Neuer Partner hat sich registriert.'});
+    }
+    setMessage('Registrierung angelegt. Bitte E-Mail bestätigen, falls Supabase dies verlangt.');
+  }
+  return <div className="auth-wrap"><form className="auth-card" onSubmit={submit}>
+    <div className="brand"><div className="brand-badge">H</div><div><b>Hertz-Partnerportal</b><div className="muted tiny">echte Supabase-Version</div></div></div>
+    <h1>{mode==='login'?'Einloggen':'Partner registrieren'}</h1>
+    {mode==='register' && <><input placeholder="Unternehmen" value={company} onChange={e=>setCompany(e.target.value)} required/><input placeholder="Ansprechpartner" value={contact} onChange={e=>setContact(e.target.value)}/></>}
+    <input type="email" placeholder="E-Mail" value={email} onChange={e=>setEmail(e.target.value)} required/>
+    <input type="password" placeholder="Passwort" value={password} onChange={e=>setPassword(e.target.value)} required minLength={6}/>
+    <button className="btn btn-primary">{mode==='login'?'Einloggen':'Registrieren'}</button>
+    <button type="button" className="link-btn" onClick={()=>setMode(mode==='login'?'register':'login')}>{mode==='login'?'Noch kein Zugang? Registrieren':'Bereits registriert? Einloggen'}</button>
+    {message && <div className="info-box">{message}</div>}
+  </form></div>
+}
+
+function App(){
+  const [session,setSession]=useState(null); const [profile,setProfile]=useState(null);
+  const [page,setPage]=useState('dashboard'); const [orders,setOrders]=useState([]); const [interests,setInterests]=useState([]);
+  const [messages,setMessages]=useState([]); const [activities,setActivities]=useState([]); const [currentOrder,setCurrentOrder]=useState(null);
+  const [search,setSearch]=useState(''); const [city,setCity]=useState('all');
+
+  useEffect(()=>{ supabase.auth.getSession().then(({data})=>setSession(data.session)); const {data:{subscription}}=supabase.auth.onAuthStateChange((_e,s)=>setSession(s)); return ()=>subscription.unsubscribe(); },[]);
+  useEffect(()=>{ if(session?.user) loadAll(); },[session]);
+
+  async function loadAll(){
+    const uid=session.user.id;
+    const [{data:prof},{data:ord},{data:int},{data:msg},{data:act}] = await Promise.all([
+      supabase.from('profiles').select('*').eq('id',uid).single(),
+      supabase.from('orders').select('*').order('created_at',{ascending:false}),
+      supabase.from('order_interests').select('*').order('created_at',{ascending:false}),
+      supabase.from('messages').select('*').order('created_at',{ascending:true}),
+      supabase.from('activities').select('*').order('created_at',{ascending:false}).limit(100)
+    ]);
+    setProfile(prof); setOrders(ord||[]); setInterests(int||[]); setMessages(msg||[]); setActivities(act||[]);
+  }
+  async function addActivity(type,details){ await supabase.from('activities').insert({type,user_name:profile?.company_name || session.user.email,details}); await loadAll(); }
+  const cities=[...new Set(orders.map(o=>o.city).filter(Boolean))];
+  const filtered=orders.filter(o=>{ const hay=[o.title,o.city,o.announcer_name,o.description,o.assigned_partner_name].join(' ').toLowerCase(); return (!search||hay.includes(search.toLowerCase())) && (city==='all'||o.city===city); });
+  const stats=[['Offen',orders.filter(o=>o.status==='Offen').length],['In Verhandlung',orders.filter(o=>o.status==='In Verhandlung').length],['Vergeben',orders.filter(o=>o.status==='Vergeben').length],['Abgeschlossen',orders.filter(o=>o.status==='Abgeschlossen').length],['Nachrichten',messages.length],['Aktivitäten',activities.length]];
+
+  async function createOrder(e){
+    e.preventDefault(); const f=new FormData(e.currentTarget);
+    await supabase.from('orders').insert({title:f.get('title'),city:f.get('city'),price:f.get('price'),volume:f.get('volume'),execution_date:f.get('date'),announcer_id:session.user.id,announcer_name:profile.company_name,description:f.get('description'),status:'Offen'});
+    await addActivity('Auftrag annonciert',`Neuer Auftrag '${f.get('title')}' in ${f.get('city')} veröffentlicht.`); e.currentTarget.reset(); setPage('orders');
+  }
+  async function expressInterest(order){
+    await supabase.from('order_interests').insert({order_id:order.id,partner_id:session.user.id,partner_name:profile.company_name});
+    if(order.status==='Offen') await supabase.from('orders').update({status:'In Verhandlung'}).eq('id',order.id);
+    await addActivity('Interesse bekundet',`Interesse am Auftrag '${order.title}' bekundet.`);
+  }
+  async function assignOrder(order,partner){
+    await supabase.from('orders').update({status:'Vergeben',assigned_partner_id:partner.partner_id,assigned_partner_name:partner.partner_name}).eq('id',order.id);
+    await addActivity('Vergabe',`Auftrag '${order.title}' wurde an ${partner.partner_name} vergeben.`);
+  }
+  async function completeOrder(order){ await supabase.from('orders').update({status:'Abgeschlossen'}).eq('id',order.id); await addActivity('Statusänderung',`Auftrag '${order.title}' abgeschlossen.`); }
+  async function sendMessage(body){ if(!body.trim()) return; await supabase.from('messages').insert({order_id:currentOrder?.id,sender_id:session.user.id,sender_name:profile.company_name,recipient_name:currentOrder?.announcer_name || 'Partner',body}); await addActivity('Nachricht',`Neue Nachricht zum Auftrag '${currentOrder?.title || 'Allgemein'}'.`); }
+  function logout(){ supabase.auth.signOut(); }
+
+  if(!session) return <AuthScreen/>;
+  return <div className="app"><aside className="sidebar"><div className="brand"><div className="brand-badge">H</div><div><b>Hertz-Partnerportal</b><div className="muted tiny">{profile?.company_name}</div></div></div>{['dashboard','orders','create','messages','admin'].map(p=><button key={p} className={'nav-btn '+(page===p?'active':'')} onClick={()=>setPage(p)}>{{dashboard:'Dashboard',orders:'Aufträge entdecken',create:'Auftrag vergeben',messages:'Nachrichten',admin:'Admin-Kalender'}[p]}</button>)}<div className="sidebar-note"><b>Live-System</b><br/>Daten werden in Supabase gespeichert. Deployment ist für Vercel vorbereitet.</div><button className="btn btn-outline" onClick={logout}>Abmelden</button></aside>
+  <main className="content"><section className="panel"><div className="panel-head"><div><h1>Hertz-Partnerportal</h1><div className="muted">Partnernetzwerk & Auftragsvergabe</div></div><div className="search-row"><input className="search" placeholder="Suche nach Ort, Auftrag, Partner..." value={search} onChange={e=>setSearch(e.target.value)}/><button className="btn btn-primary" onClick={()=>setPage('orders')}>Aufträge finden</button><button className="btn btn-success" onClick={()=>setPage('create')}>Auftrag vergeben</button></div></div></section>
+  {page==='dashboard'&&<><div className="stats">{stats.map(s=><div className="card" key={s[0]}><div className="muted tiny">{s[0]}</div><div className="stat-value">{s[1]}</div></div>)}</div><div className="grid-2"><div className="card"><h2>Aktuelle Aufträge</h2>{filtered.slice(0,2).map(o=><OrderCard key={o.id} order={o} interests={interests} onInterest={expressInterest} onAssign={assignOrder} onMessage={(x)=>{setCurrentOrder(x);setPage('messages')}} onComplete={completeOrder}/>)}</div><Activities activities={activities}/></div></>}
+  {page==='orders'&&<div className="card"><div className="row"><h2>Aufträge entdecken</h2><select value={city} onChange={e=>setCity(e.target.value)}><option value="all">Alle Orte</option>{cities.map(c=><option key={c}>{c}</option>)}</select></div>{filtered.map(o=><OrderCard key={o.id} order={o} interests={interests} onInterest={expressInterest} onAssign={assignOrder} onMessage={(x)=>{setCurrentOrder(x);setPage('messages')}} onComplete={completeOrder}/>)}</div>}
+  {page==='create'&&<div className="card"><h2>Neuen Auftrag einstellen</h2><form onSubmit={createOrder}><div className="two-col"><input name="title" placeholder="Auftragstitel" required/><input name="city" placeholder="Ausführungsort" required/><input name="price" type="number" placeholder="Preis in Euro" required/><input name="volume" placeholder="Auftragsvolumen" required/><input name="date" type="date"/></div><textarea name="description" placeholder="Beschreibung"/><button className="btn btn-success">Auftrag veröffentlichen</button></form></div>}
+  {page==='messages'&&<Messages messages={messages} order={currentOrder} onSend={sendMessage}/>} {page==='admin'&&<Activities activities={activities} full/>}</main></div>
+}
+function OrderCard({order,interests,onInterest,onAssign,onMessage,onComplete}){ const ints=interests.filter(i=>i.order_id===order.id); return <div className="order"><div className="row"><div><b className="title">{order.title}</b><div className="muted">{order.description}</div></div><span className={'badge status-'+order.status.replaceAll(' ','-')}>{order.status}</span></div><div className="meta"><div>📍 {order.city}</div><div>💶 {formatMoney(order.price)}</div><div>📦 {order.volume}</div><div>📅 {formatDate(order.execution_date)}</div></div><div className="info-box">Annonciert von: <b>{order.announcer_name}</b><br/>Interessenten: <b>{ints.length?ints.map(i=>i.partner_name).join(', '):'Noch keine'}</b><br/>Vergeben an: <b>{order.assigned_partner_name || 'Noch nicht vergeben'}</b></div><div className="actions"><button className="btn btn-primary" onClick={()=>onInterest(order)}>Interesse bekunden</button><button className="btn btn-outline" onClick={()=>onMessage(order)}>Nachricht öffnen</button>{ints[0]&&!['Vergeben','Abgeschlossen'].includes(order.status)&&<button className="btn btn-success" onClick={()=>onAssign(order,ints[0])}>Auftrag vergeben</button>}{order.status==='Vergeben'&&<button className="btn btn-outline" onClick={()=>onComplete(order)}>Als abgeschlossen markieren</button>}</div></div> }
+function Messages({messages,order,onSend}){ const [body,setBody]=useState(''); return <div className="card"><h2>Schriftverkehr</h2>{order&&<div className="info-box">Bezug: <b>{order.title}</b><br/>Auftraggeber: {order.announcer_name}</div>}{messages.filter(m=>!order||m.order_id===order.id).map(m=><div className="msg" key={m.id}><div className="row"><b>{m.sender_name} → {m.recipient_name}</b><span className="muted tiny">{new Date(m.created_at).toLocaleString('de-DE')}</span></div><p>{m.body}</p></div>)}<textarea value={body} onChange={e=>setBody(e.target.value)} placeholder="Nachricht schreiben..."/><button className="btn btn-primary" onClick={async()=>{await onSend(body);setBody('')}}>Nachricht senden</button></div> }
+function Activities({activities}){ const grouped=activities.reduce((a,x)=>{const d=new Date(x.created_at).toLocaleDateString('de-DE');(a[d]??=[]).push(x);return a;},{}); return <div className="card"><h2>Admin-Kalender</h2>{Object.entries(grouped).map(([d,items])=><div key={d}><h3>{d}</h3>{items.map(a=><div className="timeline-item" key={a.id}><div className="row"><b>{new Date(a.created_at).toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'})}</b><span className="badge">{a.type}</span></div><b>{a.user_name}</b><div className="muted">{a.details}</div></div>)}</div>)}</div> }
+createRoot(document.getElementById('root')).render(<App/>);

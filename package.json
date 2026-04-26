@@ -1,0 +1,88 @@
+create extension if not exists "pgcrypto";
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  company_name text not null,
+  contact_name text,
+  email text not null,
+  role text not null default 'partner' check (role in ('partner','admin')),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.orders (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  city text not null,
+  price numeric not null default 0,
+  volume text not null,
+  execution_date date,
+  announcer_id uuid references public.profiles(id) on delete set null,
+  announcer_name text not null,
+  status text not null default 'Offen' check (status in ('Offen','In Verhandlung','Vergeben','Abgeschlossen')),
+  description text,
+  assigned_partner_id uuid references public.profiles(id) on delete set null,
+  assigned_partner_name text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.order_interests (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid not null references public.orders(id) on delete cascade,
+  partner_id uuid not null references public.profiles(id) on delete cascade,
+  partner_name text not null,
+  created_at timestamptz not null default now(),
+  unique(order_id, partner_id)
+);
+
+create table if not exists public.messages (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid references public.orders(id) on delete cascade,
+  sender_id uuid references public.profiles(id) on delete set null,
+  sender_name text not null,
+  recipient_name text not null,
+  body text not null,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.activities (
+  id uuid primary key default gen_random_uuid(),
+  type text not null,
+  user_name text not null,
+  details text not null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.profiles enable row level security;
+alter table public.orders enable row level security;
+alter table public.order_interests enable row level security;
+alter table public.messages enable row level security;
+alter table public.activities enable row level security;
+
+create or replace function public.is_admin()
+returns boolean language sql stable security definer as $$
+  select exists(select 1 from public.profiles where id = auth.uid() and role = 'admin');
+$$;
+
+create policy "Profiles visible to logged in users" on public.profiles for select using (auth.role() = 'authenticated');
+create policy "Users insert own profile" on public.profiles for insert with check (auth.uid() = id);
+create policy "Users update own profile or admin" on public.profiles for update using (auth.uid() = id or public.is_admin());
+
+create policy "Orders visible to logged in users" on public.orders for select using (auth.role() = 'authenticated');
+create policy "Logged in users create orders" on public.orders for insert with check (auth.role() = 'authenticated');
+create policy "Owner or admin updates orders" on public.orders for update using (announcer_id = auth.uid() or public.is_admin());
+
+create policy "Interests visible" on public.order_interests for select using (auth.role() = 'authenticated');
+create policy "Users create own interest" on public.order_interests for insert with check (partner_id = auth.uid());
+
+create policy "Messages visible" on public.messages for select using (auth.role() = 'authenticated');
+create policy "Logged in users send messages" on public.messages for insert with check (sender_id = auth.uid());
+
+create policy "Activities visible" on public.activities for select using (auth.role() = 'authenticated');
+create policy "Logged in users create activities" on public.activities for insert with check (auth.role() = 'authenticated');
+
+insert into public.orders (title, city, price, volume, execution_date, announcer_name, status, description)
+values
+('DGUV V3 Prüfauftrag – Filialnetz','Hamburg',4500,'800 Geräte','2026-04-28','Heinrich Hertz Elektrotechnik GmbH','Offen','Prüfung ortsveränderlicher Betriebsmittel in mehreren Filialen.'),
+('Prüfung elektrische Betriebsmittel – Bürokomplex','München',2800,'420 Geräte','2026-05-03','Nordlicht Prüfservice','In Verhandlung','Unterstützung bei der DGUV V3 Prüfung in einem Verwaltungsgebäude.'),
+('Anlagenprüfung – Logistikstandort','Frankfurt',6200,'1.150 Geräte','2026-05-07','Main Elektro Partner','Vergeben','Prüfung von Geräten und ausgewählten ortsfesten Anlagen am Standort.')
+on conflict do nothing;
